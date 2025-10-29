@@ -1,0 +1,23 @@
+[package]
+name = "starry-ptrace"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+axerrno = { workspace = true }
+linux-raw-sys = { workspace = true, default-features = false, features = ["general"] }
+starry-core = { workspace = true }
+starry-process = { workspace = true }
+event-listener = { workspace = true }
+spin = { workspace = true }
+axhal = { workspace = true }
+axtask = { workspace = true }
+bitflags = { workspace = true }
+starry-vm = { workspace = true }
+axlog = { workspace = true }
+
+[lib]
+name = "starry_ptrace"
+path = "src/lib.rs"
+
+author = "StarryOS"
