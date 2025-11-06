@@ -2,12 +2,14 @@
 
 mod state;
 mod hook;
+mod mm;
 pub mod arch;
 
 use axerrno::{AxError, AxResult};
 use axtask::current;
-use axlog::debug;
+use axlog::{error, debug};
 use arch::current::UserRegs;
+use starry_process::Pid;
 use crate::arch::RegAccess;
 use starry_vm::{vm_read_slice, vm_write_slice};
 use starry_core::task::AsThread;
@@ -18,6 +20,7 @@ const REQ_TRACEME: u32 = 0;
 const REQ_GETREGS: u32 = 12;
 const REQ_DETACH: u32 = 17;
 const REQ_CONT: u32 = 7;
+const REQ_PEEKDATA: u32 = 2;
 // Linux request numbers (subset)
 // PTRACE_SETOPTIONS is 0x4200 per uapi/ptrace.h
 const REQ_SETOPTIONS: u32 = 0x4200;
@@ -36,7 +39,7 @@ pub use state::{stop_current_and_wait, StopReason};
 /// - PTRACE_TRACEME: 标记当前进程被父进程跟踪（仅设置状态，不做唤醒/等待）。
 /// - PTRACE_SYSCALL: 开启“下一次系统调用入口/出口停靠”的跟踪模式（仅设置状态）。
 /// 其余请求暂返回 EINVAL，后续阶段逐步补齐。
-pub fn do_ptrace(request: u32, pid: i32, addr: usize, data: usize) -> AxResult<isize> {
+pub fn do_ptrace(request: u32, pid: Pid, addr: usize, data: usize) -> AxResult<isize> {
     hook::register_hooks_once();
 
     match request {
@@ -47,16 +50,18 @@ pub fn do_ptrace(request: u32, pid: i32, addr: usize, data: usize) -> AxResult<i
                 let proc = &curr.as_thread().proc_data.proc;
                 proc.parent().map(|p| p.pid())
             };
+
+            if parent.is_none() {
+                error!("ptrace: TRACEME called but no parent for pid={}", current().as_thread().proc_data.proc.pid());
+                return Err(AxError::InvalidInput);
+            }
+
             st.with_mut(|s| {
                 s.being_traced = true;
                 s.tracer = parent;
             });
             // Debug: record that TRACEME was requested and which tracer we recorded.
-            if let Some(ppid) = parent {
-                debug!("ptrace: TRACEME pid={} tracer={}", current().as_thread().proc_data.proc.pid(), ppid);
-            } else {
-                debug!("ptrace: TRACEME pid={} tracer=None", current().as_thread().proc_data.proc.pid());
-            }
+            debug!("ptrace: TRACEME pid={} tracer={}", current().as_thread().proc_data.proc.pid(), parent.unwrap());
             Ok(0)
         }
         REQ_GETREGS => {
@@ -113,11 +118,11 @@ pub fn do_ptrace(request: u32, pid: i32, addr: usize, data: usize) -> AxResult<i
             } else {
                 let st = ensure_state_for_pid(pid)?;
                 set_syscall_tracing(&st, true);
-                pid as i32
+                pid
             };
             // PTRACE_SYSCALL 语义包含"继续执行直到下一个系统调用入口/出口"。
             debug!("ptrace: PTRACE_SYSCALL requested by pid={} target={}", current().as_thread().proc_data.proc.pid(), target_pid);
-            resume_pid(target_pid as _);
+            resume_pid(target_pid);
             Ok(0)
         }
         REQ_GETREGSET => {
@@ -192,17 +197,33 @@ pub fn do_ptrace(request: u32, pid: i32, addr: usize, data: usize) -> AxResult<i
                 Err(AxError::InvalidInput)
             }
         }
+        REQ_PEEKDATA => {
+            let st = ensure_state_for_pid(pid)?;
+            let is_stopped = st.with(|s| s.stopped);
+
+            if !is_stopped {
+                error!("ptrace: PEEKDATA pid={} not stopped", pid);
+                return Err(AxError::InvalidInput);
+            }
+
+            let mut buf = [0u8; 8];
+            mm::read_from_tracee(pid, addr, &mut buf)?;
+            vm_write_slice(data as *mut u8, &buf)?;
+
+            debug!("ptrace: PEEKDATA pid={} addr=0x{:x} data=0x{:x}", pid, addr, u64::from_le_bytes(buf));
+            Ok(0)
+        }
         _ => Err(AxError::Unsupported),
     }
 }
 
 /// Check if a given pid is in ptrace-stop; return encoded wait status if so.
-pub fn check_ptrace_stop(pid: i32) -> Option<i32> {
-    if pid < 0 { return None; }
+pub fn check_ptrace_stop(pid: Pid) -> Option<i32> {
+    if pid == 0 { return None; }
     // Only report stops for children that are actually traced by the caller.
     let me = current();
     let tracer_pid = me.as_thread().proc_data.proc.pid();
-    state::encode_ptrace_stop_status_for_tracer(pid as _, tracer_pid)
+    state::encode_ptrace_stop_status_for_tracer(pid, tracer_pid)
 }
 
 /// Stop the current task in a ptrace signal-delivery-stop with given signal.

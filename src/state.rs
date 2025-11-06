@@ -114,8 +114,8 @@ pub fn ensure_state_for_current() -> AxResult<ProcState> {
     Ok(ProcState(0))
 }
 
-pub fn ensure_state_for_pid(pid: i32) -> AxResult<ProcState> {
-    if pid < 0 { return Err(AxError::NoSuchProcess); }
+pub fn ensure_state_for_pid(pid: Pid) -> AxResult<ProcState> {
+    if pid <= 0 { return Err(AxError::NoSuchProcess); }
     // probe existence
     let _ = get_process_data(pid as Pid)?;
     Ok(ProcState(pid as Pid))
