@@ -17,6 +17,7 @@ starry-vm = { workspace = true }
 axlog = { workspace = true }
 axmm = {workspace = true}
 memory_addr = { workspace = true }
+starry-signal = { workspace = true }
 
 [lib]
 name = "starry_ptrace"

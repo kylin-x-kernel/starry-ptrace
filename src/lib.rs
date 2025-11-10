@@ -7,12 +7,13 @@ pub mod arch;
 
 use axerrno::{AxError, AxResult};
 use axtask::current;
-use axlog::{error, debug};
+use axlog::debug;
 use arch::current::UserRegs;
 use starry_process::Pid;
 use crate::arch::RegAccess;
 use starry_vm::{vm_read_slice, vm_write_slice};
-use starry_core::task::AsThread;
+use starry_core::task::{AsThread, send_signal_to_process};
+use starry_signal::{SignalInfo, Signo};
 use axhal::uspace::UserContext;
 
 
@@ -45,6 +46,7 @@ pub fn do_ptrace(request: u32, pid: Pid, addr: usize, data: usize) -> AxResult<i
     match request {
         REQ_TRACEME => {
             let st = ensure_state_for_current()?;
+            let curr_pid = current().as_thread().proc_data.proc.pid();
             let parent = {
                 let curr = current();
                 let proc = &curr.as_thread().proc_data.proc;
@@ -52,7 +54,14 @@ pub fn do_ptrace(request: u32, pid: Pid, addr: usize, data: usize) -> AxResult<i
             };
 
             if parent.is_none() {
-                error!("ptrace: TRACEME called but no parent for pid={}", current().as_thread().proc_data.proc.pid());
+                debug!("ptrace: TRACEME called but no parent for pid={}", curr_pid);
+                return Err(AxError::InvalidInput);
+            }
+
+            // Check if already being traced (prevent duplicate TRACEME)
+            let already_traced = st.with(|s| s.being_traced);
+            if already_traced {
+                debug!("ptrace: TRACEME called but already traced, pid={}", curr_pid);
                 return Err(AxError::InvalidInput);
             }
 
@@ -61,7 +70,7 @@ pub fn do_ptrace(request: u32, pid: Pid, addr: usize, data: usize) -> AxResult<i
                 s.tracer = parent;
             });
             // Debug: record that TRACEME was requested and which tracer we recorded.
-            debug!("ptrace: TRACEME pid={} tracer={}", current().as_thread().proc_data.proc.pid(), parent.unwrap());
+            debug!("[PTRACE-DEBUG] TRACEME success: pid={} tracer={}", curr_pid, parent.unwrap());
             Ok(0)
         }
         REQ_GETREGS => {
@@ -87,15 +96,77 @@ pub fn do_ptrace(request: u32, pid: Pid, addr: usize, data: usize) -> AxResult<i
             Ok(0)
         }
         REQ_CONT => {
-            // Resume the specified pid
+            // Resume the specified pid, optionally injecting a signal
+            // The 'data' parameter contains the signal number to inject/deliver (0 = suppress)
+            debug!("[PTRACE-DEBUG] PTRACE_CONT request for pid={} with signal={}", pid, data);
+
             let st = ensure_state_for_pid(pid)?;
+
+            // Check if we're resuming from a signal-delivery-stop
+            let stop_signal = st.with(|s| {
+                if let Some(state::StopReason::Signal(sig)) = s.stop_reason {
+                    Some(sig)
+                } else {
+                    None
+                }
+            });
+
             st.with_mut(|s| {
+                debug!("[PTRACE-DEBUG] PTRACE_CONT clearing stopped state for pid={}, was stopped={} reason={:?}",
+                       pid, s.stopped, s.stop_reason);
                 s.stopped = false;
                 s.stop_reason = None;
                 s.saved = None;
                 s.stop_reported = false;
             });
+
+            // Handle signal injection/delivery based on stop reason
+            if let Some(stopped_at_signal) = stop_signal {
+                // We're resuming from a signal-delivery-stop
+                debug!("[PTRACE-DEBUG] PTRACE_CONT resuming from signal-delivery-stop (sig={}), data={}",
+                       stopped_at_signal, data);
+
+                if data == 0 {
+                    // data=0 means suppress the signal - the signal is already pending,
+                    // and by not re-injecting it and just resuming, the check_signals
+                    // has already returned, so the signal won't be processed
+                    debug!("[PTRACE-DEBUG] PTRACE_CONT suppressing signal {}", stopped_at_signal);
+                } else if data as i32 == stopped_at_signal {
+                    // data matches the stop signal - let it proceed (don't inject new one)
+                    // The signal is already pending and will be processed after resume
+                    debug!("[PTRACE-DEBUG] PTRACE_CONT letting pending signal {} proceed", stopped_at_signal);
+                } else {
+                    // data is different - inject the new signal to replace the old one
+                    if let Some(signo) = Signo::from_repr(data as u8) {
+                        debug!("[PTRACE-DEBUG] PTRACE_CONT replacing signal {} with {:?}", stopped_at_signal, signo);
+                        let sig_info = SignalInfo::new_kernel(signo);
+                        if let Err(e) = send_signal_to_process(pid, Some(sig_info)) {
+                            debug!("ptrace: PTRACE_CONT failed to inject signal: {:?}", e);
+                            return Err(e);
+                        }
+                    } else {
+                        debug!("ptrace: PTRACE_CONT invalid signal number: {}", data);
+                        return Err(AxError::InvalidInput);
+                    }
+                }
+            } else if data != 0 {
+                // Not at a signal-delivery-stop, inject new signal
+                if let Some(signo) = Signo::from_repr(data as u8) {
+                    debug!("[PTRACE-DEBUG] PTRACE_CONT injecting signal {:?} into pid={}", signo, pid);
+                    let sig_info = SignalInfo::new_kernel(signo);
+                    if let Err(e) = send_signal_to_process(pid, Some(sig_info)) {
+                        debug!("ptrace: PTRACE_CONT failed to inject signal: {:?}", e);
+                        return Err(e);
+                    }
+                    debug!("[PTRACE-DEBUG] PTRACE_CONT signal {:?} injected into pid={}", signo, pid);
+                } else {
+                    debug!("ptrace: PTRACE_CONT invalid signal number: {}", data);
+                    return Err(AxError::InvalidInput);
+                }
+            }
+
             resume_pid(pid as _);
+            debug!("[PTRACE-DEBUG] PTRACE_CONT completed for pid={}", pid);
             Ok(0)
         }
         REQ_DETACH => {
@@ -111,18 +182,40 @@ pub fn do_ptrace(request: u32, pid: Pid, addr: usize, data: usize) -> AxResult<i
         }
         REQ_SYSCALL => {
             // Linux: 通常由 tracer 对 tracee 调用；Phase 1 允许 pid=0 代表当前。
+            // The 'data' parameter contains optional signal to inject (0 = no signal)
+            debug!("[PTRACE-DEBUG] PTRACE_SYSCALL request for pid={} with signal={}", pid, data);
             let target_pid = if pid == 0 {
                 let st = ensure_state_for_current()?;
                 set_syscall_tracing(&st, true);
+                debug!("[PTRACE-DEBUG] PTRACE_SYSCALL enabled syscall tracing for current process");
                 0
             } else {
                 let st = ensure_state_for_pid(pid)?;
                 set_syscall_tracing(&st, true);
+                debug!("[PTRACE-DEBUG] PTRACE_SYSCALL enabled syscall tracing for pid={}", pid);
                 pid
             };
+
+            // If data is non-zero, inject that signal into the tracee
+            if data != 0 && target_pid != 0 {
+                if let Some(signo) = Signo::from_repr(data as u8) {
+                    debug!("[PTRACE-DEBUG] PTRACE_SYSCALL injecting signal {:?} into pid={}", signo, target_pid);
+                    let sig_info = SignalInfo::new_kernel(signo);
+                    if let Err(e) = send_signal_to_process(target_pid, Some(sig_info)) {
+                        debug!("ptrace: PTRACE_SYSCALL failed to inject signal: {:?}", e);
+                        return Err(e);
+                    }
+                    debug!("[PTRACE-DEBUG] PTRACE_SYSCALL signal {:?} injected into pid={}", signo, target_pid);
+                } else {
+                    debug!("ptrace: PTRACE_SYSCALL invalid signal number: {}", data);
+                    return Err(AxError::InvalidInput);
+                }
+            }
+
             // PTRACE_SYSCALL 语义包含"继续执行直到下一个系统调用入口/出口"。
-            debug!("ptrace: PTRACE_SYSCALL requested by pid={} target={}", current().as_thread().proc_data.proc.pid(), target_pid);
+            debug!("[PTRACE-DEBUG] PTRACE_SYSCALL resuming target pid={}", target_pid);
             resume_pid(target_pid);
+            debug!("[PTRACE-DEBUG] PTRACE_SYSCALL completed for target pid={}", target_pid);
             Ok(0)
         }
         REQ_GETREGSET => {
@@ -202,7 +295,7 @@ pub fn do_ptrace(request: u32, pid: Pid, addr: usize, data: usize) -> AxResult<i
             let is_stopped = st.with(|s| s.stopped);
 
             if !is_stopped {
-                error!("ptrace: PEEKDATA pid={} not stopped", pid);
+                debug!("ptrace: PEEKDATA pid={} not stopped", pid);
                 return Err(AxError::InvalidInput);
             }
 
@@ -224,6 +317,15 @@ pub fn check_ptrace_stop(pid: Pid) -> Option<i32> {
     let me = current();
     let tracer_pid = me.as_thread().proc_data.proc.pid();
     state::encode_ptrace_stop_status_for_tracer(pid, tracer_pid)
+}
+
+/// Check if the current process is being traced.
+pub fn is_being_traced() -> bool {
+    if let Ok(st) = state::ensure_state_for_current() {
+        st.with(|s| s.being_traced)
+    } else {
+        false
+    }
 }
 
 /// Stop the current task in a ptrace signal-delivery-stop with given signal.

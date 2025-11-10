@@ -4,7 +4,7 @@ extern crate alloc;
 
 use alloc::boxed::Box;
 use event_listener::Event;
-use axtask::future::{block_on, interruptible};
+use axtask::future::block_on;
 use axerrno::{AxError, AxResult};
 use starry_core::task::get_process_data;
 use starry_process::Pid;
@@ -127,65 +127,85 @@ pub fn set_syscall_tracing(st: &ProcState, on: bool) {
 
 /// Stop the current process for ptrace and block until resumed.
 pub fn stop_current_and_wait(reason: StopReason, uctx: &axhal::uspace::UserContext) {
-    // Prepare a listener under lock, then await notification.
-    let listener_needed = {
-        let pd = get_process_data(0).expect("current process");
-        let mut guard = pd.ptrace_state.lock();
-        if guard.is_none() {
-            *guard = Some(Box::new(PtraceState::new()));
-        }
-        let st = guard
-            .as_mut()
-            .and_then(|b| b.as_mut().downcast_mut::<PtraceState>())
-            .expect("ptrace_state is not PtraceState");
-        // Mark stopped and record reason when tracing is enabled.
-        // Syscall stops require `syscall_trace`; signal-delivery and exec stops always stop.
-        let should_stop = match reason {
-            StopReason::SyscallEntry | StopReason::SyscallExit => st.being_traced && st.syscall_trace,
-            StopReason::Signal(_) | StopReason::Exec => st.being_traced,
-        };
-        if should_stop {
-            st.stopped = true;
-            st.stop_reason = Some(reason);
-            st.saved = Some(SavedCtx { tf: **uctx, sp: uctx.sp });
-            st.stop_reported = false;
-            info!("ptrace: pid={} stopped for reason={:?}", pd.proc.pid(), reason);
-            // Wake up tracer's waitpid if any; waitpid polls child_exit_event.
-            if let Some(tracer) = st.tracer {
-                if let Ok(tp) = get_process_data(tracer) {
-                    tp.child_exit_event.wake();
-                }
-            }
-            Some(st.event.listen())
-        } else {
-            None
-        }
+
+    let pd = get_process_data(0).expect("current process");
+
+    // Acquire lock and prepare to stop
+    let mut guard = pd.ptrace_state.lock();
+    if guard.is_none() {
+        *guard = Some(Box::new(PtraceState::new()));
+    }
+    let st = guard
+        .as_mut()
+        .and_then(|b| b.as_mut().downcast_mut::<PtraceState>())
+        .expect("ptrace_state is not PtraceState");
+
+    // Check if we should stop based on reason and tracing state
+    let should_stop = match reason {
+        StopReason::SyscallEntry | StopReason::SyscallExit => st.being_traced && st.syscall_trace,
+        StopReason::Signal(_) | StopReason::Exec => st.being_traced,
     };
 
-    if let Some(listener) = listener_needed {
-        // Block current task until resumed.
-        let _ = block_on(interruptible(async move {
-            listener.await;
-            // Optionally re-check stopped flag; event guarantees progress.
-            info!("ptrace: pid resumed (listener awakened)");
-            ()
-        }));
+    debug!("[PTRACE-DEBUG] stop_current_and_wait pid={} reason={:?} being_traced={} should_stop={}",
+           pd.proc.pid(), reason, st.being_traced, should_stop);
+
+    if !should_stop {
+        return;
     }
+
+    // CRITICAL FIX: Create listener BEFORE releasing lock to prevent race condition
+    // where tracer might resume us before we start waiting
+    let listener = st.event.listen();
+
+    st.stopped = true;
+    st.stop_reason = Some(reason);
+    st.saved = Some(SavedCtx { tf: **uctx, sp: uctx.sp });
+    st.stop_reported = false;
+
+    debug!("[PTRACE-DEBUG] pid={} stopped for reason={:?}, waking tracer", pd.proc.pid(), reason);
+
+    // Wake up tracer's waitpid if any; waitpid polls child_exit_event.
+    if let Some(tracer) = st.tracer {
+        if let Ok(tp) = get_process_data(tracer) {
+            tp.child_exit_event.wake();
+            debug!("[PTRACE-DEBUG] pid={} woke up tracer pid={}", pd.proc.pid(), tracer);
+        }
+    }
+
+    // Release lock before blocking - listener is already created
+    drop(guard);
+
+    debug!("[PTRACE-DEBUG] pid={} about to block waiting for resume", pd.proc.pid());
+
+    // Clear interrupt flag before blocking - we're in a signal handler and don't want
+    // the signal delivery to cause interruptible() to return early
+    let curr = axtask::current();
+    let was_interrupted = curr.interrupted();
+    debug!("[PTRACE-DEBUG] pid={} interrupt flag before wait: {}", pd.proc.pid(), was_interrupted);
+
+    // Block current task until resumed - use non-interruptible wait
+    // because we're in the middle of signal handling
+    let _ = block_on(async move {
+        listener.await;
+        debug!("[PTRACE-DEBUG] pid resumed (listener awakened)");
+    });
 }
 
 /// Resume a stopped tracee and notify waiters.
 pub fn resume_pid(pid: Pid) {
+    use axlog::debug;
     let pd = get_process_data(pid).ok();
     if let Some(pd) = pd {
         let mut guard = pd.ptrace_state.lock();
         if let Some(b) = guard.as_mut() {
             if let Some(st) = b.as_mut().downcast_mut::<PtraceState>() {
+                debug!("[PTRACE-DEBUG] resume_pid pid={} was stopped={} reason={:?}", pid, st.stopped, st.stop_reason);
                 st.stopped = false;
-                info!("ptrace: resume_pid pid={} clearing stop_reason={:?}", pid, st.stop_reason);
                 st.stop_reason = None;
                 st.saved = None;
                 st.stop_reported = false;
                 st.event.notify(1);
+                debug!("[PTRACE-DEBUG] resume_pid pid={} notified event", pid);
             }
         }
     }
@@ -224,11 +244,12 @@ pub fn encode_ptrace_stop_status(pid: Pid) -> Option<i32> {
 /// Encode a ptrace stop for a specific tracer, and mark it reported so it will
 /// not be returned again until the tracee is resumed.
 pub fn encode_ptrace_stop_status_for_tracer(pid: Pid, expected_tracer: Pid) -> Option<i32> {
+    use axlog::debug;
     let pd = get_process_data(pid).ok()?;
     let mut guard = pd.ptrace_state.lock();
     let st = guard.as_mut()?.as_mut().downcast_mut::<PtraceState>()?;
     // Debug: print the current ptrace state to help diagnose tracer/tracee mismatches
-    debug!("ptrace: encode_for_tracer pid={} stopped={} stop_reported={} st.tracer={:?} expected={}",
+    debug!("[PTRACE-DEBUG] encode_for_tracer pid={} stopped={} stop_reported={} st.tracer={:?} expected={}",
         pid, st.stopped, st.stop_reported, st.tracer, expected_tracer);
 
     if st.stopped && !st.stop_reported && st.tracer == Some(expected_tracer) {
@@ -248,10 +269,12 @@ pub fn encode_ptrace_stop_status_for_tracer(pid: Pid, expected_tracer: Pid) -> O
             sig |= 0x80;
         }
         let status = (sig << 8) | 0x7f;
-        debug!("ptrace: encode stop status pid={} reason={:?} sig={} status=0x{:x}",
+        debug!("[PTRACE-DEBUG] encode stop status pid={} reason={:?} sig={} status=0x{:x}",
               pid, st.stop_reason, sig, status);
         Some(status)
     } else {
+        debug!("[PTRACE-DEBUG] encode_for_tracer pid={} NOT returning stop (stopped={} reported={} tracer_match={})",
+               pid, st.stopped, st.stop_reported, st.tracer == Some(expected_tracer));
         None
     }
 }
