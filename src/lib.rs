@@ -531,6 +531,22 @@ pub fn is_being_traced() -> bool {
     }
 }
 
+/// Check if the current process is tracing a specific PID.
+///
+/// # Arguments
+/// * `pid` - The process ID to check.
+///
+/// # Returns
+/// * `bool` - True if the current process is tracing the specified PID, false otherwise.
+pub fn is_tracing(pid: Pid) -> bool {
+    if let Ok(st) = state::ensure_state_for_pid(pid) {
+        let tracer_pid = current().as_thread().proc_data.proc.pid();
+        st.with(|s| s.being_traced && s.tracer == Some(tracer_pid))
+    } else {
+        false
+    }
+}
+
 /// Stop the current task in a ptrace signal-delivery-stop with given signal.
 ///
 /// This is used by the signal handling path to emulate Linux ptrace behavior
