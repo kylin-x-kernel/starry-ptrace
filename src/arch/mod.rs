@@ -15,6 +15,8 @@ pub trait RegAccess {
     ///
     /// Some architectures keep SP outside the TrapFrame (e.g., AArch64 stores
     /// user SP in UserContext). So we pass it separately.
-    fn from_ctx(tf: &axhal::context::TrapFrame, sp: u64) -> Self where Self: Sized;
+    fn from_ctx(tf: &axhal::context::TrapFrame, sp: u64) -> Self
+    where
+        Self: Sized;
     // fn write_to_trapframe(&self, tf: &mut axhal::context::TrapFrame);
 }

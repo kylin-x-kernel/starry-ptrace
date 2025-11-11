@@ -16,7 +16,7 @@ impl RegAccess for UserRegs {
     /// Build the user-visible register set from a trap context.
     /// Some architectures keep SP outside the TrapFrame (e.g., AArch64 stores
     /// user SP in UserContext). So we pass it separately.
-    /// 
+    ///
     /// # Arguments
     /// * `tf` - The trap frame of the current task.
     /// * `sp` - The user stack pointer.
