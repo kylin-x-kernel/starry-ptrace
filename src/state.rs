@@ -4,12 +4,17 @@ extern crate alloc;
 
 use alloc::boxed::Box;
 use axerrno::{AxError, AxResult};
-use axlog::{debug, info};
+use axlog::debug;
 use axtask::future::block_on;
 use bitflags::bitflags;
 use event_listener::Event;
 use starry_core::task::get_process_data;
 use starry_process::Pid;
+
+use crate::{PTRACE_EVENT_FORK, PTRACE_EVENT_VFORK, PTRACE_EVENT_VFORK_DONE, PTRACE_EVENT_CLONE, PTRACE_EVENT_EXIT};
+
+const SIGTRAP: i32 = 5;
+const SIG_BIT_MASK: i32 = 0x7f;
 
 bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -29,12 +34,19 @@ bitflags! {
     }
 }
 
+/// Reasons for which a traced process may stop, 
+/// which can be interpreted as an event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopReason {
     SyscallEntry,
     SyscallExit,
     Signal(i32),
     Exec,
+    Fork(Pid),
+    Vfork(Pid),
+    VforkDone(Pid),
+    Clone(Pid),
+    Exit(i32),
 }
 
 pub struct PtraceState {
@@ -160,13 +172,31 @@ pub fn stop_current_and_wait(reason: StopReason, uctx: &axhal::uspace::UserConte
     let should_stop = match reason {
         StopReason::SyscallEntry | StopReason::SyscallExit => st.being_traced && st.syscall_trace,
         StopReason::Signal(_) | StopReason::Exec => st.being_traced,
+        StopReason::Fork(_) => {
+            st.being_traced && st.options.contains(PtraceOptions::TRACEFORK)
+        }
+        StopReason::Vfork(_) => {
+            st.being_traced && st.options.contains(PtraceOptions::TRACEVFORK)
+        }
+        StopReason::Clone(_) => {
+            st.being_traced && st.options.contains(PtraceOptions::TRACECLONE)
+        }
+        StopReason::VforkDone(_) => {
+            // Note: TRACEVFORKDONE is not a valid option in the current PtraceOptions
+            // VforkDone events are typically delivered automatically after vfork completion
+            st.being_traced
+        }
+        StopReason::Exit(_) => {
+            st.being_traced && st.options.contains(PtraceOptions::TRACEEXIT)
+        }
     };
 
     debug!(
-        "[PTRACE-DEBUG] stop_current_and_wait pid={} reason={:?} being_traced={} should_stop={}",
+        "[PTRACE-DEBUG] stop_current_and_wait pid={} reason={:?} being_traced={} options={:?} should_stop={}",
         pd.proc.pid(),
         reason,
         st.being_traced,
+        st.options,
         should_stop
     );
 
@@ -278,28 +308,35 @@ pub fn encode_ptrace_stop_status(pid: Pid) -> Option<i32> {
         // - Syscall stops report SIGTRAP (optionally OR 0x80 with TRACESYSGOOD)
         // - Exec stops report SIGTRAP
         // - Signal-delivery stops report the actual signal number
-        const SIGTRAP: i32 = 5;
-        let mut sig = match st.stop_reason {
-            Some(StopReason::SyscallEntry) | Some(StopReason::SyscallExit) => SIGTRAP,
-            Some(StopReason::Exec) => SIGTRAP,
-            Some(StopReason::Signal(n)) => n,
-            None => SIGTRAP,
+        let mut status = match st.stop_reason {
+            Some(StopReason::SyscallEntry) | Some(StopReason::SyscallExit) => {
+                let mut sig = SIGTRAP;
+                // If TRACESYSGOOD is set and this is a syscall stop, set the 0x80 bit
+                // By doing so, tracers can distinguish syscall stops from normal SIGTRAP
+                if st.options.contains(PtraceOptions::TRACESYSGOOD) {
+                    sig |= 0x80;
+                }
+                sig << 8 | SIG_BIT_MASK
+            },
+            Some(StopReason::Exec) => (SIGTRAP << 8) | SIG_BIT_MASK,
+            Some(StopReason::Signal(n)) => (n << 8) | SIG_BIT_MASK,
+            Some(StopReason::Fork(_)) =>
+                (PTRACE_EVENT_FORK << 16) | (SIGTRAP << 8) | SIG_BIT_MASK,
+            Some(StopReason::Vfork(_)) =>
+                (PTRACE_EVENT_VFORK << 16) | (SIGTRAP << 8) | SIG_BIT_MASK,
+            Some(StopReason::VforkDone(_)) =>
+                (PTRACE_EVENT_VFORK_DONE << 16) | (SIGTRAP << 8) | SIG_BIT_MASK,
+            Some(StopReason::Clone(_)) =>
+                (PTRACE_EVENT_CLONE << 16) | (SIGTRAP << 8) | SIG_BIT_MASK,
+            Some(StopReason::Exit(_)) =>
+                (PTRACE_EVENT_EXIT << 16) | (SIGTRAP << 8) | SIG_BIT_MASK,
+            None => (SIGTRAP << 8) | SIG_BIT_MASK,
         };
-
-        // If TRACESYSGOOD is set and this is a syscall stop, set the 0x80 bit
-        // By doing so, tracers can distinguish syscall stops from normal SIGTRAP
-        if st.options.contains(PtraceOptions::TRACESYSGOOD)
-            && matches!(
-                st.stop_reason,
-                Some(StopReason::SyscallEntry | StopReason::SyscallExit)
-            )
-        {
-            sig |= 0x80;
-        }
-        let status = (sig << 8) | 0x7f;
-        info!(
-            "ptrace: encode stop status pid={} sig={} status=0x{:x}",
-            pid, sig, status
+        debug!(
+            "[PTRACE-DEBUG] encode_ptrace_stop_status pid={} reason={:?} status=0x{:x}",
+            pid,
+            st.stop_reason,
+            status
         );
         Some(status)
     } else {
@@ -318,7 +355,6 @@ pub fn encode_ptrace_stop_status(pid: Pid) -> Option<i32> {
 /// * `Some(i32)` - Encoded wait status if the tracee is stopped and matches the tracer.
 /// * `None` - If the tracee is not stopped, already reported, or tracer
 pub fn encode_ptrace_stop_status_for_tracer(pid: Pid, expected_tracer: Pid) -> Option<i32> {
-    use axlog::debug;
     let pd = get_process_data(pid).ok()?;
     let mut guard = pd.ptrace_state.lock();
     let st = guard.as_mut()?.as_mut().downcast_mut::<PtraceState>()?;
@@ -333,24 +369,46 @@ pub fn encode_ptrace_stop_status_for_tracer(pid: Pid, expected_tracer: Pid) -> O
         st.stop_reported = true;
         // Compute status using current state values.
         const SIGTRAP: i32 = 5;
-        let mut sig = match st.stop_reason {
-            Some(StopReason::SyscallEntry) | Some(StopReason::SyscallExit) => SIGTRAP,
-            Some(StopReason::Exec) => SIGTRAP,
-            Some(StopReason::Signal(n)) => n,
-            None => SIGTRAP,
+        let status = match st.stop_reason {
+            Some(StopReason::SyscallEntry) | Some(StopReason::SyscallExit) => {
+                let mut sig = SIGTRAP;
+                if st.options.contains(PtraceOptions::TRACESYSGOOD) {
+                    sig |= 0x80;
+                }
+                (sig << 8) | SIG_BIT_MASK
+            }
+            Some(StopReason::Exec) => {
+                (SIGTRAP << 8) | SIG_BIT_MASK
+            }
+            Some(StopReason::Signal(n)) => {
+                n << 8 | SIG_BIT_MASK
+            }
+            Some(StopReason::Fork(_)) => {
+                (crate::PTRACE_EVENT_FORK << 16) | (SIGTRAP << 8) | SIG_BIT_MASK
+            }
+
+            Some(StopReason::Vfork(_)) => {
+                (crate::PTRACE_EVENT_VFORK << 16) | (SIGTRAP << 8) | SIG_BIT_MASK
+            }
+
+            Some(StopReason::Clone(_)) => {
+                (crate::PTRACE_EVENT_CLONE << 16) | (SIGTRAP << 8) | SIG_BIT_MASK
+            }
+
+            Some(StopReason::VforkDone(_)) => {
+                (crate::PTRACE_EVENT_VFORK_DONE << 16) | (SIGTRAP << 8) | SIG_BIT_MASK
+            }
+
+            Some(StopReason::Exit(_)) => {
+                (crate::PTRACE_EVENT_EXIT << 16) | (SIGTRAP << 8) | SIG_BIT_MASK
+            }
+            None => {
+                SIGTRAP << 8 | SIG_BIT_MASK
+            }
         };
-        if st.options.contains(PtraceOptions::TRACESYSGOOD)
-            && matches!(
-                st.stop_reason,
-                Some(StopReason::SyscallEntry | StopReason::SyscallExit)
-            )
-        {
-            sig |= 0x80;
-        }
-        let status = (sig << 8) | 0x7f;
         debug!(
-            "[PTRACE-DEBUG] encode stop status pid={} reason={:?} sig={} status=0x{:x}",
-            pid, st.stop_reason, sig, status
+            "[PTRACE-DEBUG] encode stop status pid={} reason={:?} status=0x{:x}",
+            pid, st.stop_reason, status
         );
         Some(status)
     } else {

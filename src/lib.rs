@@ -11,7 +11,7 @@ use axerrno::{AxError, AxResult};
 use axhal::uspace::UserContext;
 use axlog::debug;
 use axtask::current;
-use starry_core::task::{AsThread, get_process_data, send_signal_to_process};
+use starry_core::task::{AsThread, send_signal_to_process};
 use starry_process::Pid;
 use starry_signal::{SignalInfo, Signo};
 use starry_vm::{vm_read_slice, vm_write_slice};
@@ -22,15 +22,26 @@ const REQ_DETACH: u32 = 17;
 const REQ_CONT: u32 = 7;
 const REQ_PEEKDATA: u32 = 2;
 const REQ_ATTACH: u32 = 16;
+const REQ_SYSCALL: u32 = 24;
 // Linux request numbers (subset)
 // PTRACE_SETOPTIONS is 0x4200 per uapi/ptrace.h
 const REQ_SETOPTIONS: u32 = 0x4200;
-const REQ_SYSCALL: u32 = 24;
+// Used to get event message (e.g., new child PID)
+const REQ_GETEVENTMSG: u32 = 0x4201;
 // Regset-based register access (used by strace on AArch64)
 const REQ_GETREGSET: u32 = 0x4204;
 // Minimal note type for general-purpose regs
 const NT_PRSTATUS: usize = 1;
-use state::{
+
+pub const PTRACE_EVENT_FORK: i32 = 1;
+pub const PTRACE_EVENT_VFORK: i32 = 2;
+pub const PTRACE_EVENT_CLONE: i32 = 3;
+pub const PTRACE_EVENT_EXEC: i32 = 4;
+pub const PTRACE_EVENT_VFORK_DONE: i32 = 5;
+pub const PTRACE_EVENT_EXIT: i32 = 6;
+pub const PTRACE_EVENT_SECCOMP: i32 = 7;
+
+pub use state::{
     PtraceOptions, ensure_state_for_current, ensure_state_for_pid, resume_pid, set_syscall_tracing,
 };
 
@@ -497,6 +508,43 @@ pub fn do_ptrace(request: u32, pid: Pid, addr: usize, data: usize) -> AxResult<i
             );
             Ok(0)
         }
+        REQ_GETEVENTMSG => {
+            // Handle the GETEVENTMSG request to retrieve event message from a stopped tracee
+            // This is used to get information about certain ptrace events, such as new child PIDs
+            debug!(
+                "[PTRACE-DEBUG] PTRACE_GETEVENTMSG request for pid={}",
+                pid
+            );
+            // First, start with checking if the target is stopped
+            let st = ensure_state_for_pid(pid)?;
+            let event_msg = st.with(|s| {
+                // We don't have an event message unless stopped
+                if !s.stopped {
+                    debug!("ptrace: GETEVENTMSG pid={} not stopped", pid);
+                    return Err(AxError::InvalidInput);
+                }
+
+                match s.stop_reason {
+                    // For fork/vfork/clone events, return the new child PID for the tracer who queries it
+                    Some(StopReason::Fork(child_pid)) | Some(StopReason::Vfork(child_pid)) | Some(StopReason::Clone(child_pid)) => Ok(child_pid as usize),
+                    // For exit event, return the exit status
+                    Some(StopReason::Exit(exit_status)) => Ok(exit_status as usize),
+                    // TODO: handle other event types like EXEC, SECCOMP if needed
+                    _ => {
+                        debug!("ptrace: GETEVENTMSG pid={} no event message available", pid);
+                        Err(AxError::InvalidInput)
+                    }
+                }
+            })?;
+
+            // Write the event message back to user space
+            vm_write_slice(data as *mut u8, &event_msg.to_ne_bytes())?;
+            debug!(
+                "[PTRACE-DEBUG] PTRACE_GETEVENTMSG pid={} event_msg=0x{:x}",
+                pid, event_msg
+            );
+            Ok(0)
+        }
         _ => Err(AxError::Unsupported),
     }
 }
@@ -539,10 +587,19 @@ pub fn is_being_traced() -> bool {
 /// # Returns
 /// * `bool` - True if the current process is tracing the specified PID, false otherwise.
 pub fn is_tracing(pid: Pid) -> bool {
+    let tracer_pid = current().as_thread().proc_data.proc.pid();
     if let Ok(st) = state::ensure_state_for_pid(pid) {
-        let tracer_pid = current().as_thread().proc_data.proc.pid();
-        st.with(|s| s.being_traced && s.tracer == Some(tracer_pid))
+        let result = st.with(|s| {
+            debug!(
+                "[PTRACE-DEBUG] is_tracing: checking pid={} from tracer={} being_traced={} s.tracer={:?}",
+                pid, tracer_pid, s.being_traced, s.tracer
+            );
+            s.being_traced && s.tracer == Some(tracer_pid)
+        });
+        debug!("[PTRACE-DEBUG] is_tracing: pid={} result={}", pid, result);
+        result
     } else {
+        debug!("[PTRACE-DEBUG] is_tracing: pid={} ensure_state_for_pid FAILED", pid);
         false
     }
 }
@@ -579,4 +636,23 @@ pub fn clear_on_exit() {
         s.saved = None;
         s.stop_reported = false;
     });
+}
+
+/// Get the corresponding tracer PID, if any, for a given process.
+///
+/// # Arguments
+/// * `pid` - The process ID to check.
+///
+/// # Returns
+/// * `Ok(Pid)` - The tracer PID if the process is being traced.
+/// * `Err(AxError)` - If the process is not being traced or doesn't exist.
+pub fn get_tracer(pid: Pid) -> AxResult<Pid> {
+    let st = state::ensure_state_for_pid(pid)?;
+    st.with(|s| {
+        if s.being_traced {
+            s.tracer.ok_or(AxError::NotFound)
+        } else {
+            Err(AxError::NotFound)
+        }
+    })
 }
