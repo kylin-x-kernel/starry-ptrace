@@ -42,7 +42,7 @@ pub const PTRACE_EVENT_EXIT: i32 = 6;
 pub const PTRACE_EVENT_SECCOMP: i32 = 7;
 
 pub use state::{
-    PtraceOptions, ensure_state_for_current, ensure_state_for_pid, resume_pid, set_syscall_tracing,
+    PtraceOptions, ensure_state_for_current, ensure_state_for_pid, resume_pid, set_syscall_tracing, SignalAction
 };
 
 // Export for use in execve syscall
@@ -161,7 +161,7 @@ pub fn do_ptrace(request: u32, pid: Pid, addr: usize, data: usize) -> AxResult<i
                 }
             });
 
-            // Clear stopped state and stop reason
+            // Clear stopped state and stop reason, store tracer's signal decision
             st.with_mut(|s| {
                 debug!("[PTRACE-DEBUG] PTRACE_CONT clearing stopped state for pid={}, was stopped={} reason={:?}",
                        pid, s.stopped, s.stop_reason);
@@ -169,6 +169,8 @@ pub fn do_ptrace(request: u32, pid: Pid, addr: usize, data: usize) -> AxResult<i
                 s.stop_reason = None;
                 s.saved = None;
                 s.stop_reported = false;
+                // Store tracer's signal decision (0 = suppress, otherwise the signal number)
+                s.injected_signal = if data == 0 { None } else { Some(data as i32) };
             });
 
             // Handle signal injection/delivery based on stop reason
@@ -579,6 +581,25 @@ pub fn is_being_traced() -> bool {
     }
 }
 
+/// Check if a specific tracer PID is tracing a specific tracee PID.
+///
+/// This is used by waitpid to verify that the caller is the tracer of a process
+/// before reporting ptrace stops (needed for `strace -p` on non-child processes).
+///
+/// # Arguments
+/// * `tracer_pid` - The PID of the potential tracer
+/// * `tracee_pid` - The PID of the potential tracee
+///
+/// # Returns
+/// * `bool` - True if tracer_pid is tracing tracee_pid, false otherwise
+pub fn is_tracer_of(tracer_pid: Pid, tracee_pid: Pid) -> bool {
+    if let Ok(st) = state::ensure_state_for_pid(tracee_pid) {
+        st.with(|s| s.tracer == Some(tracer_pid))
+    } else {
+        false
+    }
+}
+
 /// Check if the current process is tracing a specific PID.
 ///
 /// # Arguments
@@ -616,10 +637,32 @@ pub fn is_tracing(pid: Pid) -> bool {
 /// # Arguments
 /// * `signo` - The signal number causing the stop.
 /// * `uctx` - The user context of the current task.
+///
+/// # Returns
+/// * `SignalAction` - The action to take with the signal (suppress, deliver original, or deliver modified)
 #[inline]
-pub fn signal_stop(signo: i32, uctx: &UserContext) {
+pub fn signal_stop(signo: i32, uctx: &UserContext) -> state::SignalAction {
     // Best-effort: only stop if being traced; the helper handles checks.
     state::stop_current_and_wait(state::StopReason::Signal(signo), uctx);
+
+    // After resume, check what the tracer decided
+    let st = state::ensure_state_for_current().unwrap();
+    st.with(|s| {
+        match s.injected_signal {
+            None => {
+                // Tracer passed data=0 → suppress the signal
+                state::SignalAction::Suppress
+            }
+            Some(new_sig) if new_sig == signo => {
+                // Tracer passed the same signal → deliver original
+                state::SignalAction::DeliverOriginal
+            }
+            Some(new_sig) => {
+                // Tracer changed the signal number → deliver modified
+                state::SignalAction::DeliverModified(new_sig)
+            }
+        }
+    })
 }
 
 /// Clear ptrace state for the current process when it exits.

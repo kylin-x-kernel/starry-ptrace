@@ -8,7 +8,6 @@ axerrno = { workspace = true }
 linux-raw-sys = { workspace = true, default-features = false, features = ["general"] }
 starry-core = { workspace = true }
 starry-process = { workspace = true }
-event-listener = { workspace = true }
 spin = { workspace = true }
 axhal = { workspace = true }
 axtask = { workspace = true }
