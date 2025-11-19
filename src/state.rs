@@ -9,7 +9,7 @@ use axerrno::{AxError, AxResult};
 use axlog::info;
 use axtask::future::block_on;
 use bitflags::bitflags;
-use starry_core::task::get_process_data;
+use starry_core::task::{get_process_data, get_task, AsThread};
 use starry_process::Pid;
 
 use crate::{PTRACE_EVENT_FORK, PTRACE_EVENT_VFORK, PTRACE_EVENT_VFORK_DONE, PTRACE_EVENT_CLONE, PTRACE_EVENT_EXIT};
@@ -98,15 +98,17 @@ impl PtraceState {
     }
 }
 
-/// A lightweight handle bound to a process id, allowing state access helpers.
+/// A lightweight handle bound to a thread id, allowing state access helpers.
+/// Note: In Linux ptrace semantics, the pid parameter is actually a TID (thread ID).
 pub struct ProcState(pub Pid);
 
 impl ProcState {
-    /// Run a closure with mutable access to the per-process ptrace state.
+    /// Run a closure with mutable access to the per-thread ptrace state.
     /// It lazily initializes the state if absent.
     pub fn with_mut<R>(&self, f: impl FnOnce(&mut PtraceState) -> R) -> R {
-        let pd = get_process_data(self.0).expect("process must exist");
-        let mut guard = pd.ptrace_state.lock();
+        let task = get_task(self.0).expect("thread must exist");
+        let thread = task.as_thread();
+        let mut guard = thread.ptrace_state.lock();
         if guard.is_none() {
             *guard = Some(Box::new(PtraceState::new()));
         }
@@ -121,8 +123,9 @@ impl ProcState {
     /// If the state is not initialized yet, passes a temporary default
     /// `PtraceState` (treat as not traced) to avoid panics in early hooks.
     pub fn with<R>(&self, f: impl FnOnce(&PtraceState) -> R) -> R {
-        let pd = get_process_data(self.0).expect("process must exist");
-        let guard = pd.ptrace_state.lock();
+        let task = get_task(self.0).expect("thread must exist");
+        let thread = task.as_thread();
+        let guard = thread.ptrace_state.lock();
         if let Some(st) = guard
             .as_ref()
             .and_then(|b| b.as_ref().downcast_ref::<PtraceState>())
@@ -136,7 +139,7 @@ impl ProcState {
 }
 
 pub fn ensure_state_for_current() -> AxResult<ProcState> {
-    // pid=0 represents current in starry_core::task::get_process_data
+    // pid=0 represents current in starry_core::task::get_task
     Ok(ProcState(0))
 }
 
@@ -144,8 +147,8 @@ pub fn ensure_state_for_pid(pid: Pid) -> AxResult<ProcState> {
     if pid <= 0 {
         return Err(AxError::NoSuchProcess);
     }
-    // probe existence
-    let _ = get_process_data(pid as Pid)?;
+    // probe existence - use get_task since ptrace state is now per-thread
+    let _ = get_task(pid as Pid)?;
     Ok(ProcState(pid as Pid))
 }
 
@@ -170,11 +173,13 @@ pub fn set_syscall_tracing(st: &ProcState, on: bool) {
 /// * `reason` - The reason for stopping (e.g., syscall entry/exit, signal delivery).
 /// * `uctx` - The user context of the current process, used to save state.
 pub fn stop_current_and_wait(reason: StopReason, uctx: &axhal::uspace::UserContext) {
-    let pd = get_process_data(0).expect("current process");
-    let curr_pid = pd.proc.pid();
+    let task = get_task(0).expect("current task");
+    let thread = task.as_thread();
+    let pd = thread.proc_data.clone();
+    let curr_tid = task.id().as_u64() as Pid;
 
     // Acquire lock and prepare to stop
-    let mut guard = pd.ptrace_state.lock();
+    let mut guard = thread.ptrace_state.lock();
     if guard.is_none() {
         *guard = Some(Box::new(PtraceState::new()));
     }
@@ -208,7 +213,7 @@ pub fn stop_current_and_wait(reason: StopReason, uctx: &axhal::uspace::UserConte
 
     info!(
         "[PTRACE-DEBUG] stop_current_and_wait pid={} reason={:?} being_traced={} options={:?} should_stop={}",
-        pd.proc.pid(),
+        curr_tid,
         reason,
         st.being_traced,
         st.options,
@@ -245,7 +250,7 @@ pub fn stop_current_and_wait(reason: StopReason, uctx: &axhal::uspace::UserConte
 
     info!(
         "[PTRACE-DEBUG] pid={} entering ptrace-stop with signal={}",
-        curr_pid, stop_signal
+        curr_tid, stop_signal
     );
 
     // Update the tracee to be stopped by ptrace mech with the stop signal
@@ -255,15 +260,15 @@ pub fn stop_current_and_wait(reason: StopReason, uctx: &axhal::uspace::UserConte
     if let Some(tracer_pid) = tracer {
         if let Ok(tp) = get_process_data(tracer_pid) {
             tp.child_exit_event.wake();
-            info!("[PTRACE-DEBUG] pid={} woke tracer pid={}", curr_pid, tracer_pid);
+            info!("[PTRACE-DEBUG] pid={} woke tracer pid={}", curr_tid, tracer_pid);
         }
     }
 
     // Block until resumed
-    info!("[PTRACE-DEBUG] pid={} blocking in ptrace-stop", curr_pid);
+    info!("[PTRACE-DEBUG] pid={} blocking in ptrace-stop", curr_tid);
     block_on(poll_fn(|cx| {
         if !pd.proc.is_ptrace_stopped() {
-            info!("[PTRACE-DEBUG] pid={} resumed from ptrace-stop", curr_pid);
+            info!("[PTRACE-DEBUG] pid={} resumed from ptrace-stop", curr_tid);
             Poll::Ready(())
         } else {
             pd.child_exit_event.register(cx.waker());
@@ -271,7 +276,7 @@ pub fn stop_current_and_wait(reason: StopReason, uctx: &axhal::uspace::UserConte
         }
     }));
 
-    info!("[PTRACE-DEBUG] pid={} exited ptrace-stop blocking", curr_pid);
+    info!("[PTRACE-DEBUG] pid={} exited ptrace-stop blocking", curr_tid);
 }
 
 /// Resume a stopped tracee and notify waiters, clearing its stop state.
@@ -284,9 +289,12 @@ pub fn stop_current_and_wait(reason: StopReason, uctx: &axhal::uspace::UserConte
 /// # Arguments
 /// * `pid` - The process ID of the tracee to resume.
 pub fn resume_pid(pid: Pid) {
-    let pd = get_process_data(pid).ok();
-    if let Some(pd) = pd {
-        let mut guard = pd.ptrace_state.lock();
+    let task = get_task(pid).ok();
+    if let Some(task) = task {
+        let thread = task.as_thread();
+        let pd = thread.proc_data.clone();
+
+        let mut guard = thread.ptrace_state.lock();
         if let Some(b) = guard.as_mut() {
             if let Some(st) = b.as_mut().downcast_mut::<PtraceState>() {
                info!(
@@ -321,8 +329,9 @@ pub fn resume_pid(pid: Pid) {
 /// * `Some(i32)` - Encoded wait status if the tracee is stopped.
 /// * `None` - If the tracee is not stopped.
 pub fn encode_ptrace_stop_status(pid: Pid) -> Option<i32> {
-    let pd = get_process_data(pid).ok()?;
-    let guard = pd.ptrace_state.lock();
+    let task = get_task(pid).ok()?;
+    let thread = task.as_thread();
+    let guard = thread.ptrace_state.lock();
     let st = guard.as_ref()?.as_ref().downcast_ref::<PtraceState>()?;
     if st.stopped {
         // Encode stop signal:
@@ -376,8 +385,9 @@ pub fn encode_ptrace_stop_status(pid: Pid) -> Option<i32> {
 /// * `Some(i32)` - Encoded wait status if the tracee is stopped and matches the tracer.
 /// * `None` - If the tracee is not stopped, already reported, or tracer
 pub fn encode_ptrace_stop_status_for_tracer(pid: Pid, expected_tracer: Pid) -> Option<i32> {
-    let pd = get_process_data(pid).ok()?;
-    let mut guard = pd.ptrace_state.lock();
+    let task = get_task(pid).ok()?;
+    let thread = task.as_thread();
+    let mut guard = thread.ptrace_state.lock();
     let st = guard.as_mut()?.as_mut().downcast_mut::<PtraceState>()?;
     // Debug: print the current ptrace state to help diagnose tracer/tracee mismatches
     info!(
