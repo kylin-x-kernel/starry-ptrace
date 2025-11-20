@@ -42,11 +42,11 @@ pub const PTRACE_EVENT_EXIT: i32 = 6;
 pub const PTRACE_EVENT_SECCOMP: i32 = 7;
 
 pub use state::{
-    PtraceOptions, ensure_state_for_current, ensure_state_for_pid, resume_pid, set_syscall_tracing, SignalAction
+    PtraceOptions, ensure_state_for_current, ensure_state_for_pid, resume_pid, set_syscall_tracing, SignalAction,
 };
 
-// Export for use in execve syscall
-pub use state::{StopReason, stop_current_and_wait};
+// Export for use in execve syscall and vfork completion
+pub use state::{StopReason, notify_vfork_done, stop_current_and_wait};
 
 /// Main ptrace interface function, which would be called by the ptrace syscall handler.
 ///
@@ -528,7 +528,10 @@ pub fn do_ptrace(request: u32, pid: Pid, addr: usize, data: usize) -> AxResult<i
 
                 match s.stop_reason {
                     // For fork/vfork/clone events, return the new child PID for the tracer who queries it
-                    Some(StopReason::Fork(child_pid)) | Some(StopReason::Vfork(child_pid)) | Some(StopReason::Clone(child_pid)) => Ok(child_pid as usize),
+                    Some(StopReason::Fork(child_pid))
+                    | Some(StopReason::Vfork(child_pid))
+                    | Some(StopReason::VforkDone(child_pid))
+                    | Some(StopReason::Clone(child_pid)) => Ok(child_pid as usize),
                     // For exit event, return the exit status
                     Some(StopReason::Exit(exit_status)) => Ok(exit_status as usize),
                     // TODO: handle other event types like EXEC, SECCOMP if needed

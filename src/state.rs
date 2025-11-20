@@ -12,7 +12,7 @@ use bitflags::bitflags;
 use starry_core::task::{get_process_data, get_task, AsThread};
 use starry_process::Pid;
 
-use crate::{PTRACE_EVENT_FORK, PTRACE_EVENT_VFORK, PTRACE_EVENT_VFORK_DONE, PTRACE_EVENT_CLONE, PTRACE_EVENT_EXIT};
+use crate::{PTRACE_EVENT_FORK, PTRACE_EVENT_VFORK, PTRACE_EVENT_VFORK_DONE, PTRACE_EVENT_CLONE, PTRACE_EVENT_EXIT, PTRACE_EVENT_EXEC};
 
 const SIGTRAP: i32 = 5;
 const SIG_BIT_MASK: i32 = 0x7f;
@@ -30,6 +30,8 @@ bitflags! {
         const TRACECLONE = 0x00000008;
         /// PTRACE_O_TRACEEXEC
         const TRACEEXEC = 0x00000010;
+        /// PTRACE_O_TRACEVFORKDONE
+        const TRACEVFORKDONE = 0x00000020;
         /// PTRACE_O_TRACEEXIT
         const TRACEEXIT = 0x00000040;
     }
@@ -62,6 +64,8 @@ pub struct PtraceState {
     pub stop_reported: bool,
     // tracer's signal decision, indicates whether the signal was injected by the tracer.
     pub injected_signal: Option<i32>,
+    /// Track the child pid for which we should emit a VFORK_DONE event.
+    pub pending_vfork_done: Option<Pid>,
 }
 
 /// Action to take after a signal-delivery-stop.
@@ -94,6 +98,7 @@ impl PtraceState {
             saved: None,
             stop_reported: false,
             injected_signal: None,
+            pending_vfork_done: None,
         }
     }
 }
@@ -191,24 +196,15 @@ pub fn stop_current_and_wait(reason: StopReason, uctx: &axhal::uspace::UserConte
     // Check if we should stop based on reason and tracing state
     let should_stop = match reason {
         StopReason::SyscallEntry | StopReason::SyscallExit => st.being_traced && st.syscall_trace,
-        StopReason::Signal(_) | StopReason::Exec => st.being_traced,
-        StopReason::Fork(_) => {
-            st.being_traced && st.options.contains(PtraceOptions::TRACEFORK)
-        }
-        StopReason::Vfork(_) => {
-            st.being_traced && st.options.contains(PtraceOptions::TRACEVFORK)
-        }
-        StopReason::Clone(_) => {
-            st.being_traced && st.options.contains(PtraceOptions::TRACECLONE)
-        }
-        StopReason::VforkDone(_) => {
-            // Note: TRACEVFORKDONE is not a valid option in the current PtraceOptions
-            // VforkDone events are typically delivered automatically after vfork completion
-            st.being_traced
-        }
-        StopReason::Exit(_) => {
-            st.being_traced && st.options.contains(PtraceOptions::TRACEEXIT)
-        }
+        StopReason::Exec => st.being_traced && st.options.contains(PtraceOptions::TRACEEXEC),
+        StopReason::Signal(_) => st.being_traced,
+        // Fork/vfork/clone events are explicitly requested via options, so emit
+        // them when the option is set.
+        StopReason::Fork(_) => st.options.contains(PtraceOptions::TRACEFORK),
+        StopReason::Vfork(_) => st.options.contains(PtraceOptions::TRACEVFORK),
+        StopReason::Clone(_) => st.options.contains(PtraceOptions::TRACECLONE),
+        StopReason::VforkDone(_) => st.options.contains(PtraceOptions::TRACEVFORKDONE),
+        StopReason::Exit(_) => st.being_traced && st.options.contains(PtraceOptions::TRACEEXIT),
     };
 
     info!(
@@ -348,7 +344,8 @@ pub fn encode_ptrace_stop_status(pid: Pid) -> Option<i32> {
                 }
                 sig << 8 | SIG_BIT_MASK
             },
-            Some(StopReason::Exec) => (SIGTRAP << 8) | SIG_BIT_MASK,
+            Some(StopReason::Exec) =>
+                (crate::PTRACE_EVENT_EXEC << 16) | (SIGTRAP << 8) | SIG_BIT_MASK,
             Some(StopReason::Signal(n)) => (n << 8) | SIG_BIT_MASK,
             Some(StopReason::Fork(_)) =>
                 (PTRACE_EVENT_FORK << 16) | (SIGTRAP << 8) | SIG_BIT_MASK,
@@ -409,7 +406,7 @@ pub fn encode_ptrace_stop_status_for_tracer(pid: Pid, expected_tracer: Pid) -> O
                 (sig << 8) | SIG_BIT_MASK
             }
             Some(StopReason::Exec) => {
-                (SIGTRAP << 8) | SIG_BIT_MASK
+                (crate::PTRACE_EVENT_EXEC << 16) | (SIGTRAP << 8) | SIG_BIT_MASK
             }
             Some(StopReason::Signal(n)) => {
                 n << 8 | SIG_BIT_MASK
@@ -452,4 +449,46 @@ pub fn encode_ptrace_stop_status_for_tracer(pid: Pid, expected_tracer: Pid) -> O
         );
         None
     }
+}
+
+/// Notify a traced parent that a vfork child has completed, delivering
+/// PTRACE_EVENT_VFORK_DONE if the parent requested it.
+pub fn notify_vfork_done(parent_pid: Pid, child_pid: Pid) {
+    let Ok(task) = get_task(parent_pid) else {
+        return;
+    };
+    let thread = task.as_thread();
+    let pd = thread.proc_data.clone();
+
+    let mut guard = thread.ptrace_state.lock();
+    let Some(st) = guard
+        .as_mut()
+        .and_then(|b| b.as_mut().downcast_mut::<PtraceState>()) else {
+        return;
+    };
+
+    if !st.being_traced
+        || !st.options.contains(PtraceOptions::TRACEVFORKDONE)
+        || st.pending_vfork_done != Some(child_pid)
+    {
+        return;
+    }
+
+    // Mark the parent as stopped for VFORK_DONE.
+    st.pending_vfork_done = None;
+    st.stopped = true;
+    st.stop_reason = Some(StopReason::VforkDone(child_pid));
+    st.saved = None;
+    st.stop_reported = false;
+    let tracer_pid = st.tracer;
+    drop(guard);
+
+    // Update process state and wake tracer waiters.
+    pd.proc.set_ptrace_stopped(SIGTRAP);
+    if let Some(tracer_pid) = tracer_pid {
+        if let Ok(tp) = get_process_data(tracer_pid) {
+            tp.child_exit_event.wake();
+        }
+    }
+    pd.child_exit_event.wake();
 }
